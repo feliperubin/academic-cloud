@@ -1,0 +1,16 @@
+;
+; reverse pointers for 10.0.0/24 subnet
+;
+$ORIGIN 0.0.10.in-addr.arpa.
+$TTL 1D
+@     IN SOA  ns.centralmesh.com. admin.centralmesh.com.  ( 2007120710 1d 2h 4w 1h )
+
+; define the authoritative name server
+              NS      ns.centralmesh.com.
+; our hosts, in numeric order
+2             PTR     gateway.centralmesh.com.
+3             PTR     kvm1.centralmesh.com.
+4             PTR     kvm2.centralmesh.com.
+5             PTR     data1.centralmesh.com.
+6             PTR     data2.centralmesh.com.
+7             PTR     control1.centralmesh.com.

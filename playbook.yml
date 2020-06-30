@@ -1,0 +1,777 @@
+---
+# Author: Felipe Pfeifer Rubin
+# Contact: felipe.rubin@edu.pucrs.br
+
+
+################################ UNDERLYING INFRASTRUCTURE SETUP ################################
+
+- name: Infrastructure Layer Basic Setup
+  gather_facts: yes # Only Once
+  hosts: all
+  become: yes
+  ignore_unreachable: false
+  tasks:
+    - name: Write /etc/hosts
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '.*{{ item }}$'
+        line: "{{ hostvars[item].ansible_host }} {{item}}"
+        state: present
+      when: hostvars[item].ansible_host is defined
+      with_items: "{{ groups.all }}"
+      changed_when: false
+    - name: General Linux Dependencies
+      script: scripts/infrastructure/host/general.sh
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.host.general.stamp
+      changed_when: false
+
+
+- name: Infrastructure Layer Optional Services
+  hosts: gateway
+  tags: never,bonjour
+  become: yes
+  ignore_unreachable: false
+  gather_facts: no
+  tasks:
+    - name: Install Gateway mDNS Service
+      script: scripts/infrastructure/services/avahi.sh
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.avahi.stamp
+        changed_when: false
+
+- name: Infrastructure Layer Network Gateway
+  hosts: gateway
+  become: yes
+  ignore_unreachable: false
+  tasks:
+    - name: Install NTP Server
+      script: scripts/infrastructure/services/ntp.sh -s
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.ntp.stamp
+      changed_when: false    
+    - name: Configure NAT Interface
+      script: >
+        scripts/infrastructure/network/routing.sh router \
+        --ip "{{provider_network_gateway}}" --mask "{{provider_network_mask}}" \
+        --gateway "{{wan_port_gateway_ip}}" --ilan "{{lan_port}}" --iwan "{{wan_port}}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: "/.routing.{{lan_port}}.stamp"
+      changed_when: false
+    - stat:
+        path: "/.reboot.required.stamp"
+      register: st
+    - name: Reboot Gateway
+      reboot:
+        post_reboot_delay: 10
+        reboot_timeout: 300
+      when: st.stat.exists
+    - name: Clean Reboot Stamp
+      file:
+        state: absent
+        path: "/.reboot.required.stamp"
+      when: st.stat.exists
+
+- name: Infrastructure Layer Services
+  gather_facts: no
+  hosts: all:!gateway
+  become: yes
+  ignore_unreachable: false
+  tags: perf,min
+  tasks:
+    - name: Install Networking and API
+      script: scripts/infrastructure/host/setup.sh
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.host.setup.stamp
+      changed_when: false
+    - name: Install NTP Client
+      script: scripts/infrastructure/services/ntp.sh -c {{ hostvars['gateway'].ansible_host }}
+      register: ntp_client_result
+      args:
+        creates: /.ntp.stamp
+      changed_when: false
+
+# COMPUTE ONLY
+
+- name: Infrastructure Layer IaaS Requirements
+  gather_facts: no
+  hosts: controller:compute
+  become: yes
+  ignore_unreachable: false
+  tags: perf,min
+  tasks:
+    - name: Install KVM Kernel Module
+      script: scripts/infrastructure/host/kvm.sh
+      args:
+        creates: /.kvm.stamp
+      changed_when: false
+      when: ('compute' in group_names)
+    - name: Configure Linux Bridges
+      script: scripts/infrastructure/network/bridges.sh "{{bridges_nic}}"
+      args:
+        creates: /.bridges.stamp
+      changed_when: false
+      when: ('compute' in group_names) or ("'controller' == inventory_hostname")
+
+#  COMPUTE AND CONTROLLER
+
+  
+- name: Infrastructure Layer Complete Setup
+  gather_facts: no
+  hosts: all
+  become: yes
+  ignore_unreachable: false
+  tasks:
+    - stat:
+        path: "/.reboot.required.stamp"
+      register: st
+    - name: Fullfil Pending Reboot
+      reboot:
+        post_reboot_delay: 10
+        reboot_timeout: 300
+      when: st.stat.exists
+    - name: Clean Reboot Stamp
+      file:
+        state: absent
+        path: "/.reboot.required.stamp"
+      when: st.stat.exists
+
+############################################################################################################
+
+
+
+################################ PERFORMANCE MONITORING ################################
+
+# Install agents on every machine
+- name: Infrastructure Performance Monitoring
+  gather_facts: no
+  hosts: all
+  become: yes
+  ignore_unreachable: false
+  tags: monitoring
+  vars:
+    prometheus_targets: >
+      "{{ groups['all'] | map('extract', hostvars, ['ansible_host']) | join(':9103,') }}:9103"
+  tasks:
+    - name: Metrics Agent (collectd)
+      script: scripts/monitoring/collectd.sh --time "{{collectd_time}}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.collectd.stamp
+      changed_when: false
+      when: "'compute' not in group_names"
+    - name: Metrics Agent (collectd with libvirt)
+      script: scripts/monitoring/collectd.sh --time "{{collectd_time}}" --plugin "virt"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.collectd.stamp
+      changed_when: false
+      when: "('compute' in group_names)"
+    - name: Logs Agent (promtail)
+      script: scripts/monitoring/promtail.sh  "{{ hostvars['gateway'].ansible_host }}"
+      register: result
+      failed_when: result.rc != 0      
+      args:
+        creates: /.promtail.stamp
+      changed_when: false
+    - name: Aggregation and Visualization
+      block:
+        - name: Install Prometheus
+          script: >
+            scripts/monitoring/prometheus.sh \
+            --targets "{{prometheus_targets}}" \
+            --time "{{prometheus_time}}"
+          args:
+            creates: /.prometheus.stamp
+          changed_when: false
+        - name: Install Loki
+          script: scripts/monitoring/loki.sh
+          register: result
+          failed_when: result.rc != 0      
+          args:
+            creates: /.loki.stamp
+          changed_when: false  
+        - name: Install Grafana
+          script: >
+            scripts/monitoring/grafana.sh \
+            --time "{{grafana_time}}" --prometheus "127.0.0.1:9090" --loki "127.0.0.1:3100"
+          register: result
+          failed_when: result.rc != 0      
+          args:
+            creates: /.grafana.stamp
+          changed_when: false
+        - debug:
+            msg: >
+              "Grafana Installation Complete! \
+              Set your Password at: \
+              http://{{ hostvars[inventory_hostname].ansible_host }}:3000"
+      when: "'gateway' == inventory_hostname"
+
+
+################################ OPENSTACK SERVICES ################################
+
+- name: Service Layer Dependencies
+  gather_facts: no
+  hosts: controller
+  become: yes
+  ignore_unreachable: false
+  tags: ctrl
+  vars:
+    rabbituser: openstack
+    rabbitpass: admin
+    mysqladminpass: admin
+    memcached_access: "0.0.0.0"
+  tasks:
+    - name: Install MySQL (MariaDB)
+      script: >
+        scripts/infrastructure/services/mysql.sh \
+        "{{ mysqladminpass }}" "{{ hostvars[inventory_hostname].ansible_host }}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.mysql.stamp
+      changed_when: false
+    - name: Install RabbitMQ
+      script: scripts/infrastructure/services/rabbitmq.sh "{{ rabbituser }}" "{{ rabbitpass }}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.rabbitmq.stamp      
+      changed_when: false
+    - name: Install Memcached
+      script: scripts/infrastructure/services/memcached.sh "{{memcached_access}}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.memcached.stamp      
+      changed_when: false
+    - name: Install Etcd
+      script: scripts/infrastructure/services/etcd.sh "{{ hostvars[inventory_hostname].ansible_host }}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.etcd.stamp      
+      changed_when: false
+
+- name: Service Layer Database Setup
+  gather_facts: no
+  hosts: controller
+  become: yes
+  vars:
+    services:
+      - {name: keystone, user: keystone, pass: admin}
+      - {name: glance, user: glance, pass: admin}
+      - {name: placement, user: placement, pass: admin}
+      - {name: nova_api, user: nova, pass: admin}
+      - {name: nova, user: nova, pass: admin}
+      - {name: nova_cell0, user: nova, pass: admin}
+      - {name: neutron, user: neutron, pass: admin}
+      - {name: cinder, user: cinder, pass: admin}
+      - {name: heat, user: heat, pass: admin}
+    rabbituser: openstack
+    rabbitpass: admin
+    mysqladminpass: admin
+    memcached_access: "0.0.0.0"
+  tasks:
+    - name: Create Databases
+      script: >
+        scripts/openstack/service/create.sh \
+        "{{mysqladminpass}}" "{{ item.name }}" \
+        "{{ item.user }}" "{{ item.pass }}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: "/.createdb.{{item.name}}.mysql.stamp"
+      changed_when: false
+      with_items: "{{services}}"  
+
+######################################### OpenStack IaaS #####################################################
+
+
+- name: Service Layer IaaS General Services
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: controller
+  tasks:
+    - name: Install Keystone
+      script: scripts/openstack/service/install.sh keystone
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.keystone.stamp
+      changed_when: false
+    - name: Configure Keystone
+      script: >
+        scripts/openstack/service/config.sh keystone --password "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --region "RegionOne" --dbuser "keystone" --dbpass "admin" --dbname "keystone" \
+        --cfg "/etc/keystone/keystone.conf" database token
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.keystone.stamp
+      changed_when: false
+    - name: Retrieve Adminrc
+      fetch:
+          src: ~/adminrc
+          dest: credentials/adminrc
+          flat: yes
+    - name: Install Glance
+      script: scripts/openstack/service/install.sh glance
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.glance.stamp
+      changed_when: false      
+    - name: Register Glance
+      script: >
+        scripts/openstack/service/register.sh glance \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "Image Service" --type "image" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:9292" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:9292" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:9292"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.glance.stamp
+      changed_when: false
+    - name: Configure Glance
+      tags: glancecfg
+      script: >
+        scripts/openstack/service/config.sh glance --password "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --dbuser "glance" --dbpass "admin" --dbname "glance" --datadir "/var/lib/glance/images/" \
+        --cfg "/etc/glance/glance-api.conf" keystone_authtoken database paste_deploy glance_store
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.glance.stamp
+      changed_when: false
+    - name: Install Placement
+      script: scripts/openstack/service/install.sh placement
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.placement.stamp
+      changed_when: false
+    - name: Register Placement
+      script: >
+        scripts/openstack/service/register.sh placement \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "Placement API" --type "placement" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:8778" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:8778" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:8778"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.placement.stamp
+      changed_when: false
+    - name: Configure Placement
+      tags: placementcfg
+      script: >
+        scripts/openstack/service/config.sh placement --password "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --dbuser "placement" --dbpass "admin" --dbname "placement"
+        --cfg "/etc/placement/placement.conf" placement_database api keystone_authtoken
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.placement.stamp
+      changed_when: false
+
+### INSTALL NOVA
+
+- name: Service Layer IaaS Compute (1/2)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: controller
+  tasks:
+    - name: Install Nova (Controller)
+      script: scripts/openstack/service/install.sh nova controller
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.nova.controller.stamp
+      changed_when: false
+    - name: Register Nova
+      script: >
+        scripts/openstack/service/register.sh nova \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "OpenStack Compute" --type "compute" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:8774/v2.1" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:8774/v2.1" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:8774/v2.1"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.nova.stamp
+      changed_when: false
+    - name: Configure Nova (Controller)
+      script: >
+        scripts/openstack/service/config.sh nova --node "controller" --password "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --dbuser "nova" --dbpass "admin" --dbname "nova" --apidbname "nova_api" \
+        --placementpass "admin" --neutronpass "admin" --neutronsecret "admin" \
+        --managementip "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        --cfg "/etc/nova/nova.conf" \
+        database keystone_authtoken api api_database vnc glance oslo_concurrency placement neutron
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.nova_controller.stamp
+      changed_when: false
+    - name: Update Nova NoVNC
+      script: scripts/openstack/utils/novnc_upgrade.sh
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.novnc.upgrade.stamp
+        changed_when: false
+
+
+- name: Service Layer IaaS Compute (2/2)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: compute
+  tasks:
+    - name: Install Nova (Compute)
+      script: scripts/openstack/service/install.sh nova compute
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.nova.compute.stamp
+      changed_when: false
+    - name: Configure Nova (Compute)
+      script: >
+        scripts/openstack/service/config.sh nova --node "compute" --password "admin" \
+        --controller "{{ hostvars['controller'].ansible_host }}" \
+        --dbuser "nova" --dbpass "admin" --dbname "nova" --apidbname "nova_api" \
+        --placementpass "admin" --neutronpass "admin" --neutronsecret "admin" \
+        --managementip "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        --cfg "/etc/nova/nova.conf" \
+        api keystone_authtoken vnc glance oslo_concurrency placement neutron
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.nova_compute.stamp
+      changed_when: false
+
+### INSTALL NEUTRON
+
+- name: Service Layer IaaS Networks (1/2)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: controller
+  tasks: 
+    - name: Install Neutron (Controller)
+      script: scripts/openstack/service/install.sh neutron controller
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.neutron.controller.stamp
+      changed_when: false
+    - name: Register Neutron (Controller)
+      script: >
+        scripts/openstack/service/register.sh neutron \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "OpenStack Networking" --type "network" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:9696" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:9696" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:9696"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.neutron.stamp
+      changed_when: false
+      
+    - name: Configure Neutron (Controller)
+      script: >
+        scripts/openstack/service/config.sh neutron --node "controller"  --password "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --provideriface "{{bridges_nic}}" --overlayifaceip "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --novapass "admin" --dbuser "neutron" --dbpass "admin" --dbname "neutron" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        --neutronsecret "admin" --cfg "/etc/neutron/neutron.conf" \
+        database keystone_authtoken nova oslo_concurrency
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.neutron_controller.stamp
+      changed_when: false
+      
+### COMPUTE NEUTRON       
+- name: Service Layer IaaS Networks (2/2)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: compute
+  tasks: 
+    - name: Install Neutron (Compute)
+      script: scripts/openstack/service/install.sh neutron compute
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.neutron.compute.stamp
+      changed_when: false
+    - name: Configure Neutron (Compute)
+      script: >
+        scripts/openstack/service/config.sh neutron --node "compute"  --password "admin" \
+        --controller "{{ hostvars['controller'].ansible_host }}" \
+        --provideriface "{{bridges_nic}}" --overlayifaceip "{{hostvars[inventory_hostname].ansible_host}}" \
+        --novapass "admin" --dbuser "neutron" --dbpass "admin" --dbname "neutron" \
+        --neutronsecret "admin" --cfg "/etc/neutron/neutron.conf" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        keystone_authtoken oslo_concurrency
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.neutron_compute.stamp
+      changed_when: false
+
+- name: Service Layer IaaS Compute Refresh
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: controller
+  tasks:
+    - name: Host Discovery
+      script: scripts/openstack/utils/host_discovery.sh
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.host_discovery.stamp
+      changed_when: false
+
+
+### STORAGE SETUP
+
+- name: Service Layer IaaS Storage (1/2)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: controller
+  tasks: 
+    - name: Install Cinder (Controller)
+      script: scripts/openstack/service/install.sh cinder controller
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.cinder.controller.stamp
+      changed_when: false
+    - name: Register Cinder (User Only)
+      script: >
+        scripts/openstack/service/register.sh cinder \
+        --region "RegionOne" --domain "default" --password "admin" --noservice
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.cinder.stamp
+      changed_when: false   
+    - name: Register Cinder V2
+      script: >
+        scripts/openstack/service/register.sh cinderv2 \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "OpenStack Block Storage" --type "volumev2" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:8776/v2/%(project_id)s" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:8776/v2/%(project_id)s" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:8776/v2/%(project_id)s'" --nouser
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.cinderv2.stamp
+      changed_when: false
+    - name: Register Cinder V3
+      script: >
+        scripts/openstack/service/register.sh cinderv3 \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "OpenStack Block Storage" --type "volumev3" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:8776/v3/%(project_id)s" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:8776/v3/%(project_id)s" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:8776/v3/%(project_id)s" --nouser
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.cinderv3.stamp
+      changed_when: false
+    - name: Configure Cinder
+      tags: cindercfg
+      script: >
+        scripts/openstack/service/config.sh cinder \
+        --node "controller" --password "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --managementip "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --dbuser "cinder" --dbpass "admin" --dbname "cinder" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        --cfg "/etc/cinder/cinder.conf" \
+        database keystone_authtoken oslo_concurrency
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.cinder_controller.stamp
+      changed_when: false
+
+- name: Service Layer IaaS Storage (2/2)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: storage
+  tasks: 
+    - name: Install Cinder (Storage)
+      script: scripts/openstack/service/install.sh cinder storage
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.cinder.storage.stamp
+      changed_when: false
+    - name: LVM Disk (/dev/sdb)
+      script: scripts/infrastructure/host/lvm.sh "{{lvm_disk}}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: "/.{{lvm_disk}}.lvm.stamp"
+      changed_when: false      
+    - name: Configure Cinder (Storage)
+      tags: cindercfg
+      script: >
+        scripts/openstack/service/config.sh cinder \
+        --node "storage" --password "admin" \
+        --controller "{{ hostvars['controller'].ansible_host }}" \
+        --managementip "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --dbuser "cinder" --dbpass "admin" --dbname "cinder" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        --cfg "/etc/cinder/cinder.conf" \
+        keystone_authtoken database oslo_concurrency
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.cinder_storage.stamp
+      changed_when: false
+
+
+- name: Service Layer IaaS (Extras)
+  become: yes
+  tags: openstack
+  gather_facts: no
+  hosts: controller
+  tasks: 
+    - name: Install Heat
+      script: scripts/openstack/service/install.sh heat
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.install.heat.stamp
+      changed_when: false
+    - name: Register Heat
+      script: >
+        scripts/openstack/service/register.sh heat \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "Orchestration" --type "orchestration" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:8004/v1/%(tenant_id)s" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:8004/v1/%(tenant_id)s" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:8004/v1/%(tenant_id)s"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.heat.stamp
+      changed_when: false
+    - name: Register Heat Cloudformation
+      script: >
+        scripts/openstack/service/register.sh heat-cfn \
+        --region "RegionOne" --domain "default" --password "admin" \
+        --description "Orchestration" --type "cloudformation" \
+        --public "http://{{ hostvars[inventory_hostname].ansible_host }}:8000/v1" \
+        --internal "http://{{ hostvars[inventory_hostname].ansible_host }}:8000/v1" \ 
+        --admin "http://{{ hostvars[inventory_hostname].ansible_host }}:8000/v1" --nouser
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.register.heat-cfn.stamp
+      changed_when: false
+    - name: Configure Heat
+      script: >
+        scripts/openstack/service/config.sh heat 
+        --password "admin" --heatadminpass "admin" \
+        --controller "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --managementip "{{ hostvars[inventory_hostname].ansible_host }}" \
+        --dbuser "heat" --dbpass "admin" --dbname "heat" \
+        --rabbituser "openstack" --rabbitpass "admin" \
+        --cfg "/etc/heat/heat.conf" \
+        database keystone_authtoken
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.configure.heat.stamp
+      changed_when: false
+
+
+### USER ACCESS
+- name: Service Layer SaaS
+  become: yes
+  tags: openstack
+  gather_facts: yes
+  hosts: gateway
+  tasks:
+    - name: Install Dashboard (Horizon)
+      script: >
+        scripts/openstack/ui/horizon.sh \
+        "{{ hostvars[inventory_hostname].ansible_host }}" \
+        "{{ hostvars['controller'].ansible_host }}"
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.horizon.stamp
+      changed_when: false
+    - debug:
+        msg: "Gateway Public Address: {{ hostvars[inventory_hostname]['ansible_%s' | format(wan_port)].ipv4.address }}"
+
+
+############################################# GOVERNANCE #############################################
+
+- name: Management Layer Governance
+  become: yes
+  tags: governance
+  gather_facts: no
+  hosts: controller
+  tasks:
+    - name: Flavors
+      script: scripts/governance/flavors.sh
+      register: result  
+      failed_when: result.rc != 0
+      args:
+        creates: /.governance.flavors.stamp
+    - name: Networks  
+      script: scripts/governance/networks.sh  
+      register: result 
+      failed_when: result.rc != 0
+      args:
+        creates: /.governance.networks.stamp
+    - name: Images  
+      script: scripts/governance/images.sh
+      register: result
+      failed_when: result.rc != 0
+      args:
+        creates: /.governance.images.stamp
+
+
+
+

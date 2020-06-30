@@ -1,0 +1,6 @@
+.vmware
+.virtualbox
+.parallels
+#bin
+credentials/*
+!credentials/README.md

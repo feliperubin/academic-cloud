@@ -1,0 +1,26 @@
+$ORIGIN centralmesh.com. ; start zone file
+$TTL 1h ; Expiration for RR without one
+centralmesh.com.  IN  SOA   ns.centralmesh.com. admin.centralmesh.com. ( 2007120710 1d 2h 4w 1h )
+centralmesh.com.  IN  NS ns ; ns is nameserver for centralmesh.com
+ns IN A 10.0.0.2 ; Nameserver host
+ntp IN CNAME ns ; NTP Server is the same as dns
+
+; Gateway
+gateway IN A 10.0.0.2 ;
+bastion IN CNAME gateway ;
+
+; Compute Nodes
+kvm1 IN A 10.0.0.3 ;
+kvm2 IN A 10.0.0.4 ;
+compute1 IN CNAME kvm1;
+compute2 IN CNAME kvm2;
+
+; Storage Nodes
+data1 IN A 10.0.0.5 ;
+data2 IN A 10.0.0.6 ;
+storage1 IN CNAME data1 ;
+storage2 IN CNAME data2 ;
+
+; Controller Nodes
+control1 IN A 10.0.0.7 ;
+controller IN CNAME 10.0.0.7;
